@@ -93,6 +93,15 @@ var rtEndpoints = []rtEndpoint{
 	},
 }
 
+// RTFeedKeys returns the Redis keys for every polled GTFS-RT endpoint.
+func RTFeedKeys() []string {
+	keys := make([]string, len(rtEndpoints))
+	for i, ep := range rtEndpoints {
+		keys[i] = ep.RedisKey
+	}
+	return keys
+}
+
 // ─── HTTP client ─────────────────────────────────────────────────────────────
 
 // rtHTTPClient is the shared client used by every fetch goroutine.
@@ -272,7 +281,6 @@ func fetchAndPublish(ctx context.Context, rdb *redis.Client, ep rtEndpoint) erro
 	log.Printf("gtfs-rt: updated %s — entities=%d bytes=%d",
 		ep.RedisKey, len(msg.GetEntity()), len(raw))
 
-	logFeedSample(ep.RedisKey, &msg)
 	return nil
 }
 

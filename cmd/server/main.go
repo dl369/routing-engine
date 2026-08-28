@@ -5,7 +5,8 @@
 //  2. Parse the GTFS static feed into a TransitGraph held in memory.
 //  3. Initialise the Redis client and verify connectivity.
 //  4. Spawn the GTFS-RT polling worker as a background goroutine.
-//  5. (Future) Bind the HTTP routing server and serve requests.
+//  5. Spawn the RT loader to read protobuf from Redis into an in-process cache.
+//  6. (Future) Bind the HTTP routing server and serve requests.
 //
 // The process listens for SIGINT / SIGTERM; on receipt it cancels the root
 // context and waits for the RT worker to drain before exiting.
@@ -22,6 +23,7 @@ import (
 
 	"github.com/joho/godotenv"
 	"route/internal/gtfs"
+	"route/internal/rt"
 )
 
 func main() {
@@ -101,7 +103,15 @@ func main() {
 	// moment the process exits.
 	go gtfs.StartRTWorker(ctx, rdb, 15*time.Second)
 
-	// ── 6. Block until signal ─────────────────────────────────────────────────
+	// ── 6. RT loader ──────────────────────────────────────────────────────────
+	//
+	// Every 15 s (and once at startup) reads raw protobuf from each gtfsrt:*
+	// Redis key, unmarshals it, and stores a []rt.Entity slice in memory for
+	// the routing engine. The router reads from rtCache — never Redis directly.
+	rtCache := rt.NewCache()
+	go rt.StartLoader(ctx, rdb, rtCache, 15*time.Second)
+
+	// ── 7. Block until signal ─────────────────────────────────────────────────
 	//
 	// Wait here until SIGINT / SIGTERM arrives. In a future iteration this
 	// select will also wait on the HTTP server's ListenAndServe error channel.
