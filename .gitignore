@@ -1,3 +1,4 @@
 data/*.zip
 .env
 .cursor/
+DESIGN.md
