@@ -2,203 +2,626 @@
 //
 // Design goals:
 //   - Zero external dependencies — only stdlib packages.
-//   - Pre-allocated slices to avoid repeated heap growth during parsing.
-//   - Custom O(1) time parser that avoids the overhead of time.Parse and
-//     correctly handles GTFS times beyond 24:00:00.
-//   - Data is stored in flat structs (no pointer graphs) for cache efficiency.
+//   - Pointer-free columnar Feed: numeric columns hold no GC-scanned pointers.
+//   - strings.Clone on every retained ID so csv.Reader row buffers are not pinned.
+//   - Parallel parse of independent zip entries (stops / routes / services).
+//   - Custom O(1) time parser that avoids time.Parse and accepts hours 0–47.
+//
+// The Feed is a one-shot staging set for router.Build; it is not the hot path.
 package gtfs
 
 import (
 	"archive/zip"
+	"bufio"
 	"encoding/csv"
 	"fmt"
 	"io"
-	"sort"
+	"math"
+	"os"
 	"strconv"
+	"strings"
+	"sync"
+	"time"
+
 	"route/internal/models"
 )
 
-// ParseGTFS opens the GTFS zip archive at zipPath, parses the four required
-// feed files in dependency order, and returns a fully populated TransitGraph.
-//
-// Parsing order matters:
-//  1. stops.txt      — no dependencies
-//  2. routes.txt     — no dependencies
-//  3. trips.txt      — depends on routes
-//  4. stop_times.txt — depends on trips and stops
-func ParseGTFS(zipPath string) (*models.TransitGraph, error) {
-	// Open the zip archive. zip.OpenReader memory-maps the file on most
-	// platforms, so we avoid loading the entire archive into RAM at once.
-	zr, err := zip.OpenReader(zipPath)
+// ParseGTFS opens the GTFS zip archive at zipPath and returns a columnar Feed.
+// It opens the file as a ReaderAt and delegates to ParseGTFSReader.
+func ParseGTFS(zipPath string) (*models.Feed, error) {
+	f, err := os.Open(zipPath)
 	if err != nil {
 		return nil, fmt.Errorf("gtfs: open zip %q: %w", zipPath, err)
 	}
-	defer zr.Close()
+	defer f.Close()
 
-	// Build a name → *zip.File index so each parser can locate its file in O(1)
-	// rather than scanning the directory repeatedly.
+	st, err := f.Stat()
+	if err != nil {
+		return nil, fmt.Errorf("gtfs: stat zip %q: %w", zipPath, err)
+	}
+	return ParseGTFSReader(f, st.Size())
+}
+
+// ParseGTFSReader parses a GTFS zip from an io.ReaderAt (used by tests with
+// in-memory fixtures, and by ParseGTFS after opening the on-disk archive).
+//
+// Stages (barriers between them — each goroutine owns a disjoint Feed region):
+//
+//	A — concurrently: stops | routes | services (calendar then calendar_dates)
+//	B — trips (needs route + service maps)
+//	C — stop_times (needs trip + stop maps)
+func ParseGTFSReader(ra io.ReaderAt, size int64) (*models.Feed, error) {
+	// zip.NewReader reads the central directory via ReaderAt; individual
+	// entries are then inflated through deflate on Open — there is no mmap.
+	zr, err := zip.NewReader(ra, size)
+	if err != nil {
+		return nil, fmt.Errorf("gtfs: open zip reader: %w", err)
+	}
+
 	fileIndex := make(map[string]*zip.File, len(zr.File))
 	for _, f := range zr.File {
 		fileIndex[f.Name] = f
 	}
 
-	graph := &models.TransitGraph{}
-
-	if err := withZipEntry(fileIndex, "stops.txt", func(csvr *csv.Reader) error {
-		return parseStops(csvr, graph)
-	}); err != nil {
-		return nil, err
-	}
-	if err := withZipEntry(fileIndex, "routes.txt", func(csvr *csv.Reader) error {
-		return parseRoutes(csvr, graph)
-	}); err != nil {
-		return nil, err
-	}
-	if err := withZipEntry(fileIndex, "trips.txt", func(csvr *csv.Reader) error {
-		return parseTrips(csvr, graph)
-	}); err != nil {
-		return nil, err
-	}
-	if err := withZipEntry(fileIndex, "stop_times.txt", func(csvr *csv.Reader) error {
-		return parseStopTimes(csvr, graph)
-	}); err != nil {
-		return nil, err
+	feed := &models.Feed{
+		Index: models.FeedIndex{
+			Stops:    make(map[string]uint32),
+			Routes:   make(map[string]uint32),
+			Trips:    make(map[string]uint32),
+			Services: make(map[string]uint32),
+		},
 	}
 
-	// Sort every trip's stop-times slice by sequence number so the routing
-	// algorithm can do a single forward scan without random access.
-	for _, trip := range graph.Trips {
-		sort.Slice(trip.StopTimes, func(i, j int) bool {
-			return trip.StopTimes[i].Sequence < trip.StopTimes[j].Sequence
-		})
+	// ── Stage A ──────────────────────────────────────────────────────────────
+	err = runParallel(
+		func() error {
+			_, err := withZipEntry(fileIndex, "stops.txt", false, func(r *csv.Reader, n uint64) error {
+				return parseStops(r, feed, n)
+			})
+			return err
+		},
+		func() error {
+			_, err := withZipEntry(fileIndex, "routes.txt", false, func(r *csv.Reader, _ uint64) error {
+				return parseRoutes(r, feed)
+			})
+			return err
+		},
+		func() error {
+			// calendar + calendar_dates share the service intern map — sequential.
+			calFound, err := withZipEntry(fileIndex, "calendar.txt", true, func(r *csv.Reader, _ uint64) error {
+				return parseCalendar(r, feed)
+			})
+			if err != nil {
+				return err
+			}
+			datesFound, err := withZipEntry(fileIndex, "calendar_dates.txt", true, func(r *csv.Reader, _ uint64) error {
+				return parseCalendarDates(r, feed)
+			})
+			if err != nil {
+				return err
+			}
+			if !calFound && !datesFound {
+				return fmt.Errorf("gtfs: both calendar.txt and calendar_dates.txt are missing")
+			}
+			return nil
+		},
+	)
+	if err != nil {
+		return nil, err
 	}
 
-	return graph, nil
+	// ── Stage B ──────────────────────────────────────────────────────────────
+	_, err = withZipEntry(fileIndex, "trips.txt", false, func(r *csv.Reader, n uint64) error {
+		return parseTrips(r, feed, n)
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	// ── Stage C ──────────────────────────────────────────────────────────────
+	_, err = withZipEntry(fileIndex, "stop_times.txt", false, func(r *csv.Reader, n uint64) error {
+		return parseStopTimes(r, feed, n)
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	return feed, nil
+}
+
+// ---------------------------------------------------------------------------
+// Orchestration helpers
+// ---------------------------------------------------------------------------
+
+// runParallel runs fns concurrently and returns the first non-nil error in
+// call order after all have finished (stdlib WaitGroup — no x/sync/errgroup).
+func runParallel(fns ...func() error) error {
+	errs := make([]error, len(fns))
+	var wg sync.WaitGroup
+	wg.Add(len(fns))
+	for i, fn := range fns {
+		go func(i int, fn func() error) {
+			defer wg.Done()
+			errs[i] = fn()
+		}(i, fn)
+	}
+	wg.Wait()
+	for _, err := range errs {
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// withZipEntry looks up name in the zip index, opens a csv.Reader over it, and
+// calls fn. zip.File.Open is safe concurrently on different entries (each is a
+// SectionReader over the shared ReaderAt).
+//
+// If optional is true and the entry is absent, returns (false, nil).
+// Otherwise a missing entry is an error. found is true when fn was called.
+func withZipEntry(
+	idx map[string]*zip.File,
+	name string,
+	optional bool,
+	fn func(r *csv.Reader, uncompressed uint64) error,
+) (found bool, err error) {
+	f, ok := idx[name]
+	if !ok {
+		if optional {
+			return false, nil
+		}
+		return false, fmt.Errorf("gtfs: %q not found in zip", name)
+	}
+	rc, err := f.Open()
+	if err != nil {
+		return false, fmt.Errorf("gtfs: open %q: %w", name, err)
+	}
+	defer rc.Close()
+
+	csvr := csv.NewReader(bufio.NewReaderSize(rc, 1<<20)) // 1 MiB read-ahead over deflate
+	csvr.ReuseRecord = true     // reuse the []string header; fields still share one row string
+	csvr.FieldsPerRecord = -1   // tolerate trailing / missing columns; use field() everywhere
+	csvr.LazyQuotes = true
+
+	if err := fn(csvr, f.UncompressedSize64); err != nil {
+		return true, err
+	}
+	return true, nil
 }
 
 // ---------------------------------------------------------------------------
 // File-level parsers
 // ---------------------------------------------------------------------------
 
-// parseStops reads stops.txt from csvr and populates graph.Stops.
-// Required columns: stop_id, stop_lat, stop_lon.
-func parseStops(csvr *csv.Reader, graph *models.TransitGraph) error {
-	header, colStop, colLat, colLon, err := readHeader(csvr, "stops.txt",
-		"stop_id", "stop_lat", "stop_lon")
+// parentPending records a stop whose parent_station was not yet in the index
+// (forward reference). parentID is Clone'd so the CSV row is not pinned.
+type parentPending struct {
+	child    uint32
+	parentID string
+}
+
+// parseStops reads stops.txt into the stop columns and Index.Stops.
+// Required: stop_id. Optional: stop_name, stop_lat, stop_lon, location_type, parent_station.
+func parseStops(r *csv.Reader, feed *models.Feed, size uint64) error {
+	header, err := r.Read()
+	if err != nil {
+		return fmt.Errorf("gtfs: stops.txt: read header: %w", err)
+	}
+	req, opt, err := columns(header, "stops.txt",
+		[]string{"stop_id"},
+		[]string{"stop_name", "stop_lat", "stop_lon", "location_type", "parent_station"},
+	)
 	if err != nil {
 		return err
 	}
-	_ = header
+	colID := req[0]
+	colName, colLat, colLon, colLoc, colParent := opt[0], opt[1], opt[2], opt[3], opt[4]
 
-	// GTFS feeds commonly contain tens of thousands of stops; pre-allocate a
-	// reasonable capacity to avoid repeated map rehashing.
-	graph.Stops = make(map[string]*models.Stop, 8192)
+	n := int(size / 150)
+	if n < 64 {
+		n = 64
+	}
+	feed.StopIDs = make([]string, 0, n)
+	feed.StopNames = make([]string, 0, n)
+	feed.StopLat = make([]float64, 0, n)
+	feed.StopLon = make([]float64, 0, n)
+	feed.StopLocType = make([]uint8, 0, n)
+	feed.StopParent = make([]uint32, 0, n)
+	feed.Index.Stops = make(map[string]uint32, n)
+
+	pending := make([]parentPending, 0, n/4)
 
 	for {
-		rec, err := csvr.Read()
+		rec, err := r.Read()
 		if err == io.EOF {
 			break
 		}
 		if err != nil {
 			return fmt.Errorf("gtfs: stops.txt: %w", err)
 		}
+		line, _ := r.FieldPos(0)
 
-		lat, err := strconv.ParseFloat(rec[colLat], 64)
-		if err != nil {
-			return fmt.Errorf("gtfs: stops.txt: invalid lat %q: %w", rec[colLat], err)
+		rawID := field(rec, colID)
+		if rawID == "" {
+			return fmt.Errorf("gtfs: stops.txt:%d: empty stop_id", line)
 		}
-		lon, err := strconv.ParseFloat(rec[colLon], 64)
-		if err != nil {
-			return fmt.Errorf("gtfs: stops.txt: invalid lon %q: %w", rec[colLon], err)
+		if _, exists := feed.Index.Stops[rawID]; exists {
+			feed.Stats.DuplicateIDs++
+			continue
 		}
 
-		// Copy the stop_id string — rec is reused on the next Read call.
-		id := string(rec[colStop])
-		graph.Stops[id] = &models.Stop{ID: id, Lat: lat, Lon: lon}
+		locType, err := parseEnum(field(rec, colLoc), 4, 0)
+		if err != nil {
+			return fmt.Errorf("gtfs: stops.txt:%d: location_type %q: %w", line, field(rec, colLoc), err)
+		}
+
+		latStr := strings.TrimSpace(field(rec, colLat))
+		lonStr := strings.TrimSpace(field(rec, colLon))
+		var lat, lon float64
+		switch {
+		case locType <= 2:
+			if latStr == "" || lonStr == "" {
+				return fmt.Errorf("gtfs: stops.txt:%d: stop_lat/stop_lon required for location_type %d", line, locType)
+			}
+			lat, err = strconv.ParseFloat(latStr, 64)
+			if err != nil {
+				return fmt.Errorf("gtfs: stops.txt:%d: invalid stop_lat %q: %w", line, latStr, err)
+			}
+			lon, err = strconv.ParseFloat(lonStr, 64)
+			if err != nil {
+				return fmt.Errorf("gtfs: stops.txt:%d: invalid stop_lon %q: %w", line, lonStr, err)
+			}
+		default:
+			// location_type 3/4 (generic node / boarding area): coords optional.
+			if latStr == "" || lonStr == "" {
+				lat, lon = math.NaN(), math.NaN()
+			} else {
+				lat, err = strconv.ParseFloat(latStr, 64)
+				if err != nil {
+					return fmt.Errorf("gtfs: stops.txt:%d: invalid stop_lat %q: %w", line, latStr, err)
+				}
+				lon, err = strconv.ParseFloat(lonStr, 64)
+				if err != nil {
+					return fmt.Errorf("gtfs: stops.txt:%d: invalid stop_lon %q: %w", line, lonStr, err)
+				}
+			}
+		}
+
+		id := strings.Clone(rawID)
+		name := strings.Clone(field(rec, colName))
+		idx := uint32(len(feed.StopIDs))
+		feed.StopIDs = append(feed.StopIDs, id)
+		feed.StopNames = append(feed.StopNames, name)
+		feed.StopLat = append(feed.StopLat, lat)
+		feed.StopLon = append(feed.StopLon, lon)
+		feed.StopLocType = append(feed.StopLocType, locType)
+		feed.StopParent = append(feed.StopParent, models.NoIndex)
+		feed.Index.Stops[id] = idx
+
+		parentRaw := field(rec, colParent)
+		if parentRaw != "" {
+			if pidx, ok := feed.Index.Stops[parentRaw]; ok {
+				feed.StopParent[idx] = pidx
+			} else {
+				pending = append(pending, parentPending{child: idx, parentID: strings.Clone(parentRaw)})
+			}
+		}
+	}
+
+	for _, p := range pending {
+		if pidx, ok := feed.Index.Stops[p.parentID]; ok {
+			feed.StopParent[p.child] = pidx
+		} else {
+			feed.StopParent[p.child] = models.NoIndex
+			feed.Stats.ParentUnresolved++
+		}
 	}
 	return nil
 }
 
-// parseRoutes reads routes.txt from csvr and populates graph.Routes.
-// Required columns: route_id, route_short_name, route_type.
-func parseRoutes(csvr *csv.Reader, graph *models.TransitGraph) error {
-	_, colID, colName, colType, err := readHeader(csvr, "routes.txt",
-		"route_id", "route_short_name", "route_type")
+// parseRoutes reads routes.txt into the route columns and Index.Routes.
+// Required: route_id, route_type. Optional: route_short_name.
+func parseRoutes(r *csv.Reader, feed *models.Feed) error {
+	header, err := r.Read()
+	if err != nil {
+		return fmt.Errorf("gtfs: routes.txt: read header: %w", err)
+	}
+	req, opt, err := columns(header, "routes.txt",
+		[]string{"route_id", "route_type"},
+		[]string{"route_short_name"},
+	)
 	if err != nil {
 		return err
 	}
+	colID, colType := req[0], req[1]
+	colName := opt[0]
 
-	graph.Routes = make(map[string]*models.Route, 512)
+	feed.RouteIDs = make([]string, 0, 512)
+	feed.RouteShortNames = make([]string, 0, 512)
+	feed.RouteTypes = make([]uint16, 0, 512)
+	feed.Index.Routes = make(map[string]uint32, 512)
 
 	for {
-		rec, err := csvr.Read()
+		rec, err := r.Read()
 		if err == io.EOF {
 			break
 		}
 		if err != nil {
 			return fmt.Errorf("gtfs: routes.txt: %w", err)
 		}
+		line, _ := r.FieldPos(0)
 
-		routeType, err := strconv.Atoi(rec[colType])
+		rawID := field(rec, colID)
+		if rawID == "" {
+			return fmt.Errorf("gtfs: routes.txt:%d: empty route_id", line)
+		}
+		if _, exists := feed.Index.Routes[rawID]; exists {
+			continue // first wins; DuplicateIDs is reserved for stops/trips
+		}
+
+		rt, err := parseUint32(field(rec, colType))
 		if err != nil {
-			return fmt.Errorf("gtfs: routes.txt: invalid route_type %q: %w", rec[colType], err)
+			return fmt.Errorf("gtfs: routes.txt:%d: route_type %q: %w", line, field(rec, colType), err)
+		}
+		if rt > math.MaxUint16 {
+			return fmt.Errorf("gtfs: routes.txt:%d: route_type %d exceeds uint16", line, rt)
 		}
 
-		id := string(rec[colID])
-		graph.Routes[id] = &models.Route{
-			ID:        id,
-			ShortName: string(rec[colName]),
-			Type:      routeType,
-		}
+		id := strings.Clone(rawID)
+		idx := uint32(len(feed.RouteIDs))
+		feed.RouteIDs = append(feed.RouteIDs, id)
+		feed.RouteShortNames = append(feed.RouteShortNames, strings.Clone(field(rec, colName)))
+		feed.RouteTypes = append(feed.RouteTypes, uint16(rt))
+		feed.Index.Routes[id] = idx
 	}
 	return nil
 }
 
-// parseTrips reads trips.txt from csvr and populates graph.Trips with empty StopTimes
-// slices that will be filled by parseStopTimes.
-// Required columns: trip_id, route_id.
-func parseTrips(csvr *csv.Reader, graph *models.TransitGraph) error {
-	_, colTrip, colRoute, _, err := readHeader(csvr, "trips.txt",
-		"trip_id", "route_id")
+// parseCalendar reads calendar.txt into Calendars and interns service IDs.
+func parseCalendar(r *csv.Reader, feed *models.Feed) error {
+	header, err := r.Read()
+	if err != nil {
+		return fmt.Errorf("gtfs: calendar.txt: read header: %w", err)
+	}
+	req, _, err := columns(header, "calendar.txt",
+		[]string{"service_id", "monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday", "start_date", "end_date"},
+		nil,
+	)
 	if err != nil {
 		return err
 	}
-
-	graph.Trips = make(map[string]*models.Trip, 32768)
+	colSvc := req[0]
+	colMon, colTue, colWed, colThu := req[1], req[2], req[3], req[4]
+	colFri, colSat, colSun := req[5], req[6], req[7]
+	colStart, colEnd := req[8], req[9]
 
 	for {
-		rec, err := csvr.Read()
+		rec, err := r.Read()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return fmt.Errorf("gtfs: calendar.txt: %w", err)
+		}
+		line, _ := r.FieldPos(0)
+
+		svcIdx, err := internService(feed, field(rec, colSvc))
+		if err != nil {
+			return fmt.Errorf("gtfs: calendar.txt:%d: service_id: %w", line, err)
+		}
+
+		var wd uint8
+		days := [...]struct {
+			col int
+			bit uint8
+		}{
+			{colMon, models.Monday},
+			{colTue, models.Tuesday},
+			{colWed, models.Wednesday},
+			{colThu, models.Thursday},
+			{colFri, models.Friday},
+			{colSat, models.Saturday},
+			{colSun, models.Sunday},
+		}
+		for _, d := range days {
+			v, err := parseDayFlag(field(rec, d.col))
+			if err != nil {
+				return fmt.Errorf("gtfs: calendar.txt:%d: weekday flag: %w", line, err)
+			}
+			if v == 1 {
+				wd |= d.bit
+			}
+		}
+
+		start, err := parseDate(field(rec, colStart))
+		if err != nil {
+			return fmt.Errorf("gtfs: calendar.txt:%d: start_date %q: %w", line, field(rec, colStart), err)
+		}
+		end, err := parseDate(field(rec, colEnd))
+		if err != nil {
+			return fmt.Errorf("gtfs: calendar.txt:%d: end_date %q: %w", line, field(rec, colEnd), err)
+		}
+		if start > end {
+			return fmt.Errorf("gtfs: calendar.txt:%d: start_date %d > end_date %d", line, start, end)
+		}
+
+		feed.Calendars = append(feed.Calendars, models.Calendar{
+			Service:  svcIdx,
+			Weekdays: wd,
+			Start:    start,
+			End:      end,
+		})
+	}
+	return nil
+}
+
+// parseCalendarDates reads calendar_dates.txt into CalendarDates.
+// Unknown services are interned here (exception-only services).
+func parseCalendarDates(r *csv.Reader, feed *models.Feed) error {
+	header, err := r.Read()
+	if err != nil {
+		return fmt.Errorf("gtfs: calendar_dates.txt: read header: %w", err)
+	}
+	req, _, err := columns(header, "calendar_dates.txt",
+		[]string{"service_id", "date", "exception_type"},
+		nil,
+	)
+	if err != nil {
+		return err
+	}
+	colSvc, colDate, colExc := req[0], req[1], req[2]
+
+	for {
+		rec, err := r.Read()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return fmt.Errorf("gtfs: calendar_dates.txt: %w", err)
+		}
+		line, _ := r.FieldPos(0)
+
+		svcIdx, err := internService(feed, field(rec, colSvc))
+		if err != nil {
+			return fmt.Errorf("gtfs: calendar_dates.txt:%d: service_id: %w", line, err)
+		}
+		date, err := parseDate(field(rec, colDate))
+		if err != nil {
+			return fmt.Errorf("gtfs: calendar_dates.txt:%d: date %q: %w", line, field(rec, colDate), err)
+		}
+		exc, err := parseUint32(field(rec, colExc))
+		if err != nil {
+			return fmt.Errorf("gtfs: calendar_dates.txt:%d: exception_type %q: %w", line, field(rec, colExc), err)
+		}
+		if exc != 1 && exc != 2 {
+			return fmt.Errorf("gtfs: calendar_dates.txt:%d: exception_type %d (want 1 or 2)", line, exc)
+		}
+
+		feed.CalendarDates = append(feed.CalendarDates, models.CalendarDate{
+			Service: svcIdx,
+			Date:    date,
+			Added:   exc == 1,
+		})
+	}
+	return nil
+}
+
+// parseTrips reads trips.txt into trip columns. Needs route and service maps.
+// Required: trip_id, route_id, service_id.
+func parseTrips(r *csv.Reader, feed *models.Feed, size uint64) error {
+	header, err := r.Read()
+	if err != nil {
+		return fmt.Errorf("gtfs: trips.txt: read header: %w", err)
+	}
+	req, _, err := columns(header, "trips.txt",
+		[]string{"trip_id", "route_id", "service_id"},
+		nil,
+	)
+	if err != nil {
+		return err
+	}
+	colTrip, colRoute, colSvc := req[0], req[1], req[2]
+
+	n := int(size / 80)
+	if n < 64 {
+		n = 64
+	}
+	feed.TripIDs = make([]string, 0, n)
+	feed.TripRoute = make([]uint32, 0, n)
+	feed.TripService = make([]uint32, 0, n)
+	feed.Index.Trips = make(map[string]uint32, n)
+
+	for {
+		rec, err := r.Read()
 		if err == io.EOF {
 			break
 		}
 		if err != nil {
 			return fmt.Errorf("gtfs: trips.txt: %w", err)
 		}
+		line, _ := r.FieldPos(0)
 
-		id := string(rec[colTrip])
-		graph.Trips[id] = &models.Trip{
-			ID:      id,
-			RouteID: string(rec[colRoute]),
-			// Pre-allocate for a typical number of stops per trip (≈30) so the
-			// append calls in parseStopTimes rarely need to grow the slice.
-			StopTimes: make([]models.StopTime, 0, 32),
+		rawID := field(rec, colTrip)
+		if rawID == "" {
+			return fmt.Errorf("gtfs: trips.txt:%d: empty trip_id", line)
 		}
+		if _, exists := feed.Index.Trips[rawID]; exists {
+			feed.Stats.DuplicateIDs++
+			continue
+		}
+
+		routeIdx := models.NoIndex
+		rawRoute := field(rec, colRoute)
+		if ridx, ok := feed.Index.Routes[rawRoute]; ok {
+			routeIdx = ridx
+		} else {
+			feed.Stats.TripsUnknownRoute++
+		}
+
+		rawSvc := field(rec, colSvc)
+		svcIdx, ok := feed.Index.Services[rawSvc]
+		if !ok {
+			// Intern so the trip has a dense service index; without a calendar
+			// row it will never be active on any date.
+			var err error
+			svcIdx, err = internService(feed, rawSvc)
+			if err != nil {
+				return fmt.Errorf("gtfs: trips.txt:%d: service_id: %w", line, err)
+			}
+			feed.Stats.TripsUnknownService++
+		}
+
+		id := strings.Clone(rawID)
+		idx := uint32(len(feed.TripIDs))
+		feed.TripIDs = append(feed.TripIDs, id)
+		feed.TripRoute = append(feed.TripRoute, routeIdx)
+		feed.TripService = append(feed.TripService, svcIdx)
+		feed.Index.Trips[id] = idx
 	}
 	return nil
 }
 
-// parseStopTimes reads stop_times.txt from csvr — typically the largest file in a
-// GTFS feed — and appends each event to the corresponding Trip.
-// Required columns: trip_id, stop_id, arrival_time, departure_time, stop_sequence.
-func parseStopTimes(csvr *csv.Reader, graph *models.TransitGraph) error {
-	_, colTrip, colStop, colArr, colDep, colSeq, err := readHeader5(csvr, "stop_times.txt",
-		"trip_id", "stop_id", "arrival_time", "departure_time", "stop_sequence")
+// parseStopTimes reads stop_times.txt into parallel ST* columns (file order).
+// No sorting — router.Build will counting-sort by (trip, seq).
+//
+// Hot path: no fmt/strconv/closures on success. Last-trip cache avoids a map
+// lookup on consecutive rows of the same trip (common in TfNSW ordering).
+func parseStopTimes(r *csv.Reader, feed *models.Feed, size uint64) error {
+	header, err := r.Read()
+	if err != nil {
+		return fmt.Errorf("gtfs: stop_times.txt: read header: %w", err)
+	}
+	req, opt, err := columns(header, "stop_times.txt",
+		[]string{"trip_id", "stop_id", "stop_sequence"},
+		[]string{"arrival_time", "departure_time", "pickup_type", "drop_off_type"},
+	)
 	if err != nil {
 		return err
 	}
+	colTrip, colStop, colSeq := req[0], req[1], req[2]
+	colArr, colDep, colPick, colDrop := opt[0], opt[1], opt[2], opt[3]
+
+	n := int(size / 40)
+	if n < 64 {
+		n = 64
+	}
+	feed.STTrip = make([]uint32, 0, n)
+	feed.STStop = make([]uint32, 0, n)
+	feed.STSeq = make([]uint32, 0, n)
+	feed.STArr = make([]int32, 0, n)
+	feed.STDep = make([]int32, 0, n)
+	feed.STPickup = make([]uint8, 0, n)
+	feed.STDrop = make([]uint8, 0, n)
+
+	var (
+		lastTripID  string
+		lastTripIdx uint32
+		haveLast    bool
+	)
 
 	for {
-		rec, err := csvr.Read()
+		rec, err := r.Read()
 		if err == io.EOF {
 			break
 		}
@@ -206,61 +629,191 @@ func parseStopTimes(csvr *csv.Reader, graph *models.TransitGraph) error {
 			return fmt.Errorf("gtfs: stop_times.txt: %w", err)
 		}
 
-		trip, ok := graph.Trips[rec[colTrip]]
+		rawTrip := field(rec, colTrip)
+		var tripIdx uint32
+		if haveLast && rawTrip == lastTripID {
+			tripIdx = lastTripIdx
+		} else {
+			idx, ok := feed.Index.Trips[rawTrip]
+			if !ok {
+				feed.Stats.StopTimesUnknownTrip++
+				continue
+			}
+			tripIdx = idx
+			// Use the map's cloned key (TripIDs[idx]), never the row substring.
+			lastTripID = feed.TripIDs[idx]
+			lastTripIdx = idx
+			haveLast = true
+		}
+
+		rawStop := field(rec, colStop)
+		stopIdx, ok := feed.Index.Stops[rawStop]
 		if !ok {
-			// Orphaned stop_time — skip rather than hard-error; some feeds
-			// include test/deleted trips that were pruned from trips.txt.
+			feed.Stats.StopTimesUnknownStop++
 			continue
 		}
 
-		arr, err := parseGTFSTime(rec[colArr])
+		seq, err := parseUint32(field(rec, colSeq))
 		if err != nil {
-			return fmt.Errorf("gtfs: stop_times.txt: arrival_time %q: %w", rec[colArr], err)
-		}
-		dep, err := parseGTFSTime(rec[colDep])
-		if err != nil {
-			return fmt.Errorf("gtfs: stop_times.txt: departure_time %q: %w", rec[colDep], err)
-		}
-		seq, err := strconv.ParseInt(rec[colSeq], 10, 32)
-		if err != nil {
-			return fmt.Errorf("gtfs: stop_times.txt: stop_sequence %q: %w", rec[colSeq], err)
+			line, _ := r.FieldPos(0)
+			return fmt.Errorf("gtfs: stop_times.txt:%d: stop_sequence %q: %w", line, field(rec, colSeq), err)
 		}
 
-		trip.StopTimes = append(trip.StopTimes, models.StopTime{
-			StopID:        string(rec[colStop]),
-			Sequence:      int32(seq),
-			ArrivalTime:   arr,
-			DepartureTime: dep,
-		})
+		arr, err := parseOptionalTime(field(rec, colArr))
+		if err != nil {
+			line, _ := r.FieldPos(0)
+			return fmt.Errorf("gtfs: stop_times.txt:%d: arrival_time %q: %w", line, field(rec, colArr), err)
+		}
+		dep, err := parseOptionalTime(field(rec, colDep))
+		if err != nil {
+			line, _ := r.FieldPos(0)
+			return fmt.Errorf("gtfs: stop_times.txt:%d: departure_time %q: %w", line, field(rec, colDep), err)
+		}
+
+		if arr == models.NoTime && dep == models.NoTime {
+			feed.Stats.StopTimesBlankTimes++
+		} else if arr == models.NoTime {
+			arr = dep
+		} else if dep == models.NoTime {
+			dep = arr
+		}
+		if dep < arr {
+			dep = arr
+			feed.Stats.StopTimesDepBeforeArr++
+		}
+
+		var pickup, drop uint8
+		if colPick >= 0 {
+			pickup, err = parseEnum(field(rec, colPick), 3, 0)
+			if err != nil {
+				line, _ := r.FieldPos(0)
+				return fmt.Errorf("gtfs: stop_times.txt:%d: pickup_type %q: %w", line, field(rec, colPick), err)
+			}
+		}
+		if colDrop >= 0 {
+			drop, err = parseEnum(field(rec, colDrop), 3, 0)
+			if err != nil {
+				line, _ := r.FieldPos(0)
+				return fmt.Errorf("gtfs: stop_times.txt:%d: drop_off_type %q: %w", line, field(rec, colDrop), err)
+			}
+		}
+
+		feed.STTrip = append(feed.STTrip, tripIdx)
+		feed.STStop = append(feed.STStop, stopIdx)
+		feed.STSeq = append(feed.STSeq, seq)
+		feed.STArr = append(feed.STArr, arr)
+		feed.STDep = append(feed.STDep, dep)
+		feed.STPickup = append(feed.STPickup, pickup)
+		feed.STDrop = append(feed.STDrop, drop)
 	}
 	return nil
 }
 
 // ---------------------------------------------------------------------------
-// Custom time parser
+// Interning
 // ---------------------------------------------------------------------------
 
-// parseGTFSTime converts a GTFS time string ("HH:MM:SS") to an int32
-// representing total seconds past midnight.
+// internService looks up or appends a service ID. The map key and ServiceIDs
+// entry are always strings.Clone'd; lookups use the raw field (no alloc).
+func internService(feed *models.Feed, raw string) (uint32, error) {
+	if raw == "" {
+		return 0, fmt.Errorf("empty service_id")
+	}
+	if idx, ok := feed.Index.Services[raw]; ok {
+		return idx, nil
+	}
+	id := strings.Clone(raw)
+	idx := uint32(len(feed.ServiceIDs))
+	feed.ServiceIDs = append(feed.ServiceIDs, id)
+	feed.Index.Services[id] = idx
+	return idx, nil
+}
+
+// ---------------------------------------------------------------------------
+// Field helpers
+// ---------------------------------------------------------------------------
+
+// columns maps header names to indices. required names must be present;
+// optional names yield opt[i] == -1 when absent. Header cells are trimmed
+// (BOM + surrounding space) before matching.
+func columns(header []string, file string, required, optional []string) (req, opt []int, err error) {
+	index := make(map[string]int, len(header))
+	for i, h := range header {
+		index[strings.TrimSpace(trimBOM(h))] = i
+	}
+	req = make([]int, len(required))
+	for i, name := range required {
+		idx, ok := index[name]
+		if !ok {
+			return nil, nil, fmt.Errorf("gtfs: %s: missing column %q", file, name)
+		}
+		req[i] = idx
+	}
+	opt = make([]int, len(optional))
+	for i, name := range optional {
+		if idx, ok := index[name]; ok {
+			opt[i] = idx
+		} else {
+			opt[i] = -1
+		}
+	}
+	return req, opt, nil
+}
+
+// field returns rec[i], or "" when i is absent / out of range.
+func field(rec []string, i int) string {
+	if i < 0 || i >= len(rec) {
+		return ""
+	}
+	return rec[i]
+}
+
+// parseOptionalTime returns NoTime for a blank (after TrimSpace) field;
+// otherwise delegates to parseGTFSTime (which does not re-trim).
+func parseOptionalTime(s string) (int32, error) {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return models.NoTime, nil
+	}
+	return parseGTFSTime(s)
+}
+
+// parseGTFSTime converts a GTFS time string ("HH:MM:SS") to int32 seconds
+// since service-day start. Hours 0–47 are accepted (e.g. "25:30:00" = 91800);
+// never apply modulo 86400. Leading/trailing spaces are allowed.
 //
 // Why not time.Parse?
-//  1. Performance: time.Parse allocates and does locale/timezone work we don't
-//     need. This function is called millions of times for large feeds.
-//  2. Correctness: GTFS explicitly allows hours ≥ 24 for services that run
-//     past midnight on the service day (e.g. "25:30:00"). time.Parse rejects
-//     these values; this parser handles them naturally.
-//
-// The input must be exactly "H…H:MM:SS" with two-digit minutes and seconds.
-// Returns an error only if the string is structurally invalid.
+//  1. Performance: no allocation / locale work on millions of stop_times rows.
+//  2. Correctness: time.Parse rejects hours ≥ 24; GTFS requires them.
 func parseGTFSTime(s string) (int32, error) {
-	// Minimum valid length is "0:00:00" (7 chars); typical is "HH:MM:SS" (8).
+	// Callers on the hot path (parseOptionalTime) already TrimSpace; trim here
+	// so direct callers still accept padded values.
+	if len(s) > 0 && (s[0] == ' ' || s[len(s)-1] == ' ') {
+		s = strings.TrimSpace(s)
+	}
+
+	// Fast path: exactly "HH:MM:SS" (dominant form in TfNSW stop_times).
+	if len(s) == 8 && s[2] == ':' && s[5] == ':' {
+		h0, h1 := s[0]-'0', s[1]-'0'
+		m0, m1 := s[3]-'0', s[4]-'0'
+		s0, s1 := s[6]-'0', s[7]-'0'
+		if h0 > 9 || h1 > 9 || m0 > 9 || m1 > 9 || s0 > 9 || s1 > 9 {
+			return 0, fmt.Errorf("non-digit in %q", s)
+		}
+		hours := int(h0)*10 + int(h1)
+		minutes := int(m0)*10 + int(m1)
+		seconds := int(s0)*10 + int(s1)
+		if hours > 47 || minutes > 59 || seconds > 59 {
+			return 0, fmt.Errorf("out-of-range time components in %q", s)
+		}
+		return int32(hours*3600 + minutes*60 + seconds), nil
+	}
+
+	// Minimum valid length is "0:00:00" (7 chars); also handles "H:MM:SS".
 	if len(s) < 7 {
 		return 0, fmt.Errorf("too short: %q", s)
 	}
 
-	// Locate the two colon separators. We scan from the right so that a
-	// variable-width hours field (e.g. "9:00:00" vs "25:00:00") is handled
-	// without branching on hour width.
 	lastColon := len(s) - 3 // colon before SS
 	if s[lastColon] != ':' {
 		return 0, fmt.Errorf("missing second colon in %q", s)
@@ -270,7 +823,6 @@ func parseGTFSTime(s string) (int32, error) {
 		return 0, fmt.Errorf("missing first colon in %q", s)
 	}
 
-	// Parse each component as plain ASCII digits — no allocations.
 	hours, err := atoiBytes(s[:midColon])
 	if err != nil {
 		return 0, fmt.Errorf("invalid hours in %q: %w", s, err)
@@ -284,16 +836,83 @@ func parseGTFSTime(s string) (int32, error) {
 		return 0, fmt.Errorf("invalid seconds in %q: %w", s, err)
 	}
 
-	if minutes > 59 || seconds > 59 {
+	if hours > 47 || minutes > 59 || seconds > 59 {
 		return 0, fmt.Errorf("out-of-range time components in %q", s)
 	}
 
 	return int32(hours*3600 + minutes*60 + seconds), nil
 }
 
+// parseDate parses a strict yyyymmdd GTFS date into an int32, validating that
+// the calendar day exists (rejects 20240230, etc.).
+func parseDate(s string) (int32, error) {
+	s = strings.TrimSpace(s)
+	if len(s) != 8 {
+		return 0, fmt.Errorf("want yyyymmdd, got %q", s)
+	}
+	y, err := atoiBytes(s[0:4])
+	if err != nil {
+		return 0, fmt.Errorf("invalid year in %q: %w", s, err)
+	}
+	m, err := atoiBytes(s[4:6])
+	if err != nil {
+		return 0, fmt.Errorf("invalid month in %q: %w", s, err)
+	}
+	d, err := atoiBytes(s[6:8])
+	if err != nil {
+		return 0, fmt.Errorf("invalid day in %q: %w", s, err)
+	}
+	t := time.Date(y, time.Month(m), d, 0, 0, 0, 0, time.UTC)
+	if t.Year() != y || int(t.Month()) != m || t.Day() != d {
+		return 0, fmt.Errorf("invalid calendar date %q", s)
+	}
+	return int32(y*10000 + m*100 + d), nil
+}
+
+// parseEnum parses a small non-negative integer field. Blank => def.
+// Values greater than max are an error.
+func parseEnum(s string, max, def uint8) (uint8, error) {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return def, nil
+	}
+	n, err := atoiBytes(s)
+	if err != nil {
+		return 0, err
+	}
+	if n < 0 || n > int(max) {
+		return 0, fmt.Errorf("value %d out of range 0..%d", n, max)
+	}
+	return uint8(n), nil
+}
+
+// parseUint32 parses an unsigned 32-bit integer via atoiBytes with overflow check.
+func parseUint32(s string) (uint32, error) {
+	s = strings.TrimSpace(s)
+	n, err := atoiBytes(s)
+	if err != nil {
+		return 0, err
+	}
+	if n < 0 || n > math.MaxUint32 {
+		return 0, fmt.Errorf("uint32 overflow: %d", n)
+	}
+	return uint32(n), nil
+}
+
+// parseDayFlag requires exactly "0" or "1" (after trim).
+func parseDayFlag(s string) (uint8, error) {
+	s = strings.TrimSpace(s)
+	switch s {
+	case "0":
+		return 0, nil
+	case "1":
+		return 1, nil
+	default:
+		return 0, fmt.Errorf("want 0 or 1, got %q", s)
+	}
+}
+
 // atoiBytes converts a small ASCII digit string to an int without allocating.
-// It is a tight loop equivalent to strconv.Atoi but operates on a string slice
-// already pointing into the CSV record buffer.
 func atoiBytes(s string) (int, error) {
 	if len(s) == 0 {
 		return 0, fmt.Errorf("empty number string")
@@ -307,125 +926,6 @@ func atoiBytes(s string) (int, error) {
 		n = n*10 + int(c-'0')
 	}
 	return n, nil
-}
-
-// ---------------------------------------------------------------------------
-// CSV header helpers
-// ---------------------------------------------------------------------------
-
-// withZipEntry opens name from the zip index, wraps it in a csv.Reader, passes
-// that to fn, and closes the underlying stream when done.
-func withZipEntry(idx map[string]*zip.File, name string, fn func(*csv.Reader) error) error {
-	rc, err := openFile(idx, name)
-	if err != nil {
-		return err
-	}
-	defer rc.Close()
-	csvr := csv.NewReader(rc)
-	csvr.ReuseRecord = true // reuse the backing array between Read calls
-	return fn(csvr)
-}
-
-// openFile looks up name in the zip index and returns a ReadCloser.
-func openFile(idx map[string]*zip.File, name string) (io.ReadCloser, error) {
-	f, ok := idx[name]
-	if !ok {
-		return nil, fmt.Errorf("gtfs: %q not found in zip", name)
-	}
-	rc, err := f.Open()
-	if err != nil {
-		return nil, fmt.Errorf("gtfs: open %q: %w", name, err)
-	}
-	return rc, nil
-}
-
-// readHeader reads the first (header) row of a CSV and returns the zero-based
-// column indices for up to three named columns. This variadic-style approach
-// keeps the column-lookup logic in one place and lets each parser call it with
-// only the columns it actually needs.
-//
-// Returns: header row, col0, col1, col2, error.
-// col2 is -1 when only two column names are requested.
-func readHeader(r *csv.Reader, filename string, cols ...string) ([]string, int, int, int, error) {
-	header, err := r.Read()
-	if err != nil {
-		return nil, -1, -1, -1, fmt.Errorf("gtfs: %s: read header: %w", filename, err)
-	}
-
-	index := make(map[string]int, len(header))
-	for i, h := range header {
-		index[trimBOM(h)] = i
-	}
-
-	get := func(name string) (int, error) {
-		i, ok := index[name]
-		if !ok {
-			return -1, fmt.Errorf("gtfs: %s: missing column %q", filename, name)
-		}
-		return i, nil
-	}
-
-	c0, err := get(cols[0])
-	if err != nil {
-		return nil, -1, -1, -1, err
-	}
-	c1, err := get(cols[1])
-	if err != nil {
-		return nil, -1, -1, -1, err
-	}
-	c2 := -1
-	if len(cols) >= 3 {
-		c2, err = get(cols[2])
-		if err != nil {
-			return nil, -1, -1, -1, err
-		}
-	}
-	return header, c0, c1, c2, nil
-}
-
-// readHeader5 is the five-column variant used by parseStopTimes.
-// Returns: header row, col0…col4, error.
-func readHeader5(r *csv.Reader, filename string, cols ...string) ([]string, int, int, int, int, int, error) {
-	header, err := r.Read()
-	if err != nil {
-		return nil, -1, -1, -1, -1, -1, fmt.Errorf("gtfs: %s: read header: %w", filename, err)
-	}
-
-	index := make(map[string]int, len(header))
-	for i, h := range header {
-		index[trimBOM(h)] = i
-	}
-
-	get := func(name string) (int, error) {
-		i, ok := index[name]
-		if !ok {
-			return -1, fmt.Errorf("gtfs: %s: missing required column %q", filename, name)
-		}
-		return i, nil
-	}
-
-	c0, err := get(cols[0])
-	if err != nil {
-		return nil, -1, -1, -1, -1, -1, err
-	}
-	c1, err := get(cols[1])
-	if err != nil {
-		return nil, -1, -1, -1, -1, -1, err
-	}
-	c2, err := get(cols[2])
-	if err != nil {
-		return nil, -1, -1, -1, -1, -1, err
-	}
-	c3, err := get(cols[3])
-	if err != nil {
-		return nil, -1, -1, -1, -1, -1, err
-	}
-	c4, err := get(cols[4])
-	if err != nil {
-		return nil, -1, -1, -1, -1, -1, err
-	}
-
-	return header, c0, c1, c2, c3, c4, nil
 }
 
 // trimBOM strips the UTF-8 byte-order mark that some GTFS producers prepend to

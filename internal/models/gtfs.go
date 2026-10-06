@@ -1,54 +1,94 @@
 // Package models defines the core in-memory data structures for the Route
-// transit engine. Every struct is designed for cache locality: flat fields,
-// no pointer indirection inside hot-path types, and int32 times so four
-// timestamps fit in a single 64-byte cache line alongside other fields.
+// transit engine. The static parser emits a pointer-free columnar Feed; the
+// future router.Build step turns that into hot-path routing structures.
 package models
 
-// Stop represents a physical boarding/alighting node in the network.
-type Stop struct {
-	ID  string
-	Lat float64
-	Lon float64
+import "math"
+
+const (
+	NoIndex uint32 = math.MaxUint32 // unresolved / absent dense reference
+	NoTime  int32  = math.MinInt32  // blank arrival/departure (non-timepoint)
+)
+
+// Weekday bits for Calendar.Weekdays: bit0 = Monday … bit6 = Sunday.
+const (
+	Monday uint8 = 1 << iota
+	Tuesday
+	Wednesday
+	Thursday
+	Friday
+	Saturday
+	Sunday
+)
+
+// Calendar is one calendar.txt row: a service active on selected weekdays
+// between Start and End (inclusive), expressed as yyyymmdd integers.
+type Calendar struct {
+	Service  uint32 // index into Feed.ServiceIDs
+	Weekdays uint8
+	Start    int32 // yyyymmdd, inclusive
+	End      int32 // yyyymmdd, inclusive
 }
 
-// Route represents a distinct named transit line (bus route, rail line, etc.).
-type Route struct {
-	ID        string
-	ShortName string
-	// Type follows the GTFS route_type specification:
-	//   0 = Tram/Light Rail, 1 = Subway/Metro, 2 = Rail,
-	//   3 = Bus, 4 = Ferry, 5 = Cable Tram, 6 = Aerial Lift, 7 = Funicular
-	Type int
+// CalendarDate is one calendar_dates.txt exception for a service.
+type CalendarDate struct {
+	Service uint32
+	Date    int32 // yyyymmdd
+	Added   bool  // exception_type 1 = added, 2 = removed
 }
 
-// StopTime represents a single scheduled stop event within a trip.
+// FeedIndex maps GTFS string IDs to dense indices. Cold: used by router.Build
+// and RT trip matching, never by the routing hot path. Keys are strings.Clone'd.
+type FeedIndex struct {
+	Stops, Routes, Trips, Services map[string]uint32
+}
+
+// FeedStats counts tolerated data-quality issues for the startup log.
+type FeedStats struct {
+	StopTimesUnknownTrip, StopTimesUnknownStop uint32
+	StopTimesBlankTimes                        uint32 // rows with NoTime in arr or dep
+	StopTimesDepBeforeArr                      uint32 // clamped dep = arr
+	TripsUnknownRoute, TripsUnknownService     uint32
+	DuplicateIDs                               uint32
+	ParentUnresolved                           uint32
+}
+
+// Feed is the pointer-free columnar staging form of a GTFS static feed.
+// Row i of each per-entity column group describes entity with dense index i.
 //
-// Arrival and departure times are stored as int32 seconds-past-midnight rather
-// than time.Time values. This has three benefits:
-//  1. Size: 4 bytes vs 24 bytes per field — more events fit per cache line.
-//  2. Math: computing travel durations is a single integer subtraction.
-//  3. Correctness: GTFS allows times > 24 h (e.g. 25:30:00 for post-midnight
-//     services), which time.Time cannot represent without date context.
-type StopTime struct {
-	StopID        string
-	Sequence      int32
-	ArrivalTime   int32 // seconds past midnight
-	DepartureTime int32 // seconds past midnight
-}
+// Feed is consumed once by router.Build and then discarded — it is NOT the
+// routing hot-path representation. Columns use value types only (no pointers
+// inside numeric slices) so the GC has almost nothing to scan after parse.
+type Feed struct {
+	// Stops (dense index = first-seen row order in stops.txt)
+	StopIDs, StopNames []string
+	StopLat, StopLon   []float64 // NaN allowed only for location_type 3/4
+	StopLocType        []uint8   // 0 stop/platform,1 station,2 entrance,3 node,4 boarding area
+	StopParent         []uint32  // NoIndex if none or unresolved
 
-// Trip represents a single scheduled run of a route.
-// StopTimes is a contiguous slice sorted ascending by Sequence so the routing
-// algorithm can walk it with a tight, branch-predictable loop.
-type Trip struct {
-	ID        string
-	RouteID   string
-	StopTimes []StopTime // sorted by Sequence after parsing
-}
+	// Routes
+	RouteIDs, RouteShortNames []string
+	RouteTypes                []uint16 // uint16: TfNSW uses extended types (700, 712, 401, 900…)
 
-// TransitGraph is the top-level container for the entire parsed static network.
-// It is the single object handed to every routing algorithm at startup.
-type TransitGraph struct {
-	Stops  map[string]*Stop
-	Routes map[string]*Route
-	Trips  map[string]*Trip
+	// Services
+	ServiceIDs    []string
+	Calendars     []Calendar
+	CalendarDates []CalendarDate
+
+	// Trips
+	TripIDs     []string
+	TripRoute   []uint32 // NoIndex if route unknown
+	TripService []uint32 // services first seen in trips.txt are interned (no calendar => never active)
+
+	// Stop times: parallel columns, one entry per accepted row, file order (NOT sorted)
+	STTrip   []uint32
+	STStop   []uint32
+	STSeq    []uint32
+	STArr    []int32 // NoTime if blank
+	STDep    []int32 // NoTime if blank
+	STPickup []uint8 // 0 regular,1 none,2 phone agency,3 coordinate with driver
+	STDrop   []uint8
+
+	Index FeedIndex
+	Stats FeedStats
 }
