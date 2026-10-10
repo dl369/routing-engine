@@ -14,10 +14,12 @@ import (
 	"archive/zip"
 	"bufio"
 	"encoding/csv"
+	"errors"
 	"fmt"
 	"io"
 	"math"
 	"os"
+	"path"
 	"strconv"
 	"strings"
 	"sync"
@@ -58,9 +60,11 @@ func ParseGTFSReader(ra io.ReaderAt, size int64) (*models.Feed, error) {
 		return nil, fmt.Errorf("gtfs: open zip reader: %w", err)
 	}
 
-	fileIndex := make(map[string]*zip.File, len(zr.File))
-	for _, f := range zr.File {
-		fileIndex[f.Name] = f
+	// Resolve every entry up front so a missing required file fails before
+	// any parsing work is done.
+	ff, err := locateFiles(zr)
+	if err != nil {
+		return nil, err
 	}
 
 	feed := &models.Feed{
@@ -74,34 +78,18 @@ func ParseGTFSReader(ra io.ReaderAt, size int64) (*models.Feed, error) {
 
 	// ── Stage A ──────────────────────────────────────────────────────────────
 	err = runParallel(
-		func() error {
-			_, err := withZipEntry(fileIndex, "stops.txt", false, func(r *csv.Reader, n uint64) error {
-				return parseStops(r, feed, n)
-			})
-			return err
-		},
-		func() error {
-			_, err := withZipEntry(fileIndex, "routes.txt", false, func(r *csv.Reader, _ uint64) error {
-				return parseRoutes(r, feed)
-			})
-			return err
-		},
+		func() error { return parseStops(ff.stops, feed) },
+		func() error { return parseRoutes(ff.routes, feed) },
 		func() error {
 			// calendar + calendar_dates share the service intern map — sequential.
-			calFound, err := withZipEntry(fileIndex, "calendar.txt", true, func(r *csv.Reader, _ uint64) error {
-				return parseCalendar(r, feed)
-			})
-			if err != nil {
-				return err
+			// locateFiles guarantees at least one of them is present.
+			if ff.calendar != nil {
+				if err := parseCalendar(ff.calendar, feed); err != nil {
+					return err
+				}
 			}
-			datesFound, err := withZipEntry(fileIndex, "calendar_dates.txt", true, func(r *csv.Reader, _ uint64) error {
-				return parseCalendarDates(r, feed)
-			})
-			if err != nil {
-				return err
-			}
-			if !calFound && !datesFound {
-				return fmt.Errorf("gtfs: both calendar.txt and calendar_dates.txt are missing")
+			if ff.calendarDates != nil {
+				return parseCalendarDates(ff.calendarDates, feed)
 			}
 			return nil
 		},
@@ -111,18 +99,12 @@ func ParseGTFSReader(ra io.ReaderAt, size int64) (*models.Feed, error) {
 	}
 
 	// ── Stage B ──────────────────────────────────────────────────────────────
-	_, err = withZipEntry(fileIndex, "trips.txt", false, func(r *csv.Reader, n uint64) error {
-		return parseTrips(r, feed, n)
-	})
-	if err != nil {
+	if err := parseTrips(ff.trips, feed); err != nil {
 		return nil, err
 	}
 
 	// ── Stage C ──────────────────────────────────────────────────────────────
-	_, err = withZipEntry(fileIndex, "stop_times.txt", false, func(r *csv.Reader, n uint64) error {
-		return parseStopTimes(r, feed, n)
-	})
-	if err != nil {
+	if err := parseStopTimes(ff.stopTimes, feed); err != nil {
 		return nil, err
 	}
 
@@ -154,40 +136,68 @@ func runParallel(fns ...func() error) error {
 	return nil
 }
 
-// withZipEntry looks up name in the zip index, opens a csv.Reader over it, and
-// calls fn. zip.File.Open is safe concurrently on different entries (each is a
-// SectionReader over the shared ReaderAt).
-//
-// If optional is true and the entry is absent, returns (false, nil).
-// Otherwise a missing entry is an error. found is true when fn was called.
-func withZipEntry(
-	idx map[string]*zip.File,
-	name string,
-	optional bool,
-	fn func(r *csv.Reader, uncompressed uint64) error,
-) (found bool, err error) {
-	f, ok := idx[name]
-	if !ok {
-		if optional {
-			return false, nil
+// feedFiles holds the zip entries the parser reads. Required entries are
+// non-nil after locateFiles succeeds; optional entries are nil when absent.
+type feedFiles struct {
+	stops, routes, trips, stopTimes *zip.File // required
+	calendar, calendarDates         *zip.File // optional (at least one present)
+}
+
+// locateFiles finds every GTFS entry the parser needs in a single pass over
+// the zip directory. Entries are matched by base name so feeds zipped with a
+// top-level folder (e.g. "gtfs/stops.txt") are accepted.
+func locateFiles(zr *zip.Reader) (feedFiles, error) {
+	var ff feedFiles
+	for _, f := range zr.File {
+		switch path.Base(f.Name) {
+		case "stops.txt":
+			ff.stops = f
+		case "routes.txt":
+			ff.routes = f
+		case "trips.txt":
+			ff.trips = f
+		case "stop_times.txt":
+			ff.stopTimes = f
+		case "calendar.txt":
+			ff.calendar = f
+		case "calendar_dates.txt":
+			ff.calendarDates = f
 		}
-		return false, fmt.Errorf("gtfs: %q not found in zip", name)
 	}
+
+	switch {
+	case ff.stops == nil:
+		return ff, errors.New("gtfs: stops.txt not found in zip")
+	case ff.routes == nil:
+		return ff, errors.New("gtfs: routes.txt not found in zip")
+	case ff.trips == nil:
+		return ff, errors.New("gtfs: trips.txt not found in zip")
+	case ff.stopTimes == nil:
+		return ff, errors.New("gtfs: stop_times.txt not found in zip")
+	case ff.calendar == nil && ff.calendarDates == nil:
+		return ff, errors.New("gtfs: both calendar.txt and calendar_dates.txt are missing")
+	}
+	return ff, nil
+}
+
+// openCSV opens a zip entry and wraps it in a csv.Reader configured for GTFS.
+// The caller must Close the returned io.Closer. zip.File.Open is safe
+// concurrently on different entries (each is a SectionReader over the shared
+// ReaderAt).
+func openCSV(f *zip.File) (*csv.Reader, io.Closer, error) {
 	rc, err := f.Open()
 	if err != nil {
-		return false, fmt.Errorf("gtfs: open %q: %w", name, err)
+		return nil, nil, fmt.Errorf("gtfs: open %q: %w", f.Name, err)
 	}
-	defer rc.Close()
 
-	csvr := csv.NewReader(bufio.NewReaderSize(rc, 1<<20)) // 1 MiB read-ahead over deflate
-	csvr.ReuseRecord = true     // reuse the []string header; fields still share one row string
-	csvr.FieldsPerRecord = -1   // tolerate trailing / missing columns; use field() everywhere
-	csvr.LazyQuotes = true
-
-	if err := fn(csvr, f.UncompressedSize64); err != nil {
-		return true, err
-	}
-	return true, nil
+	// 1 MiB read-ahead over deflate.
+	r := csv.NewReader(bufio.NewReaderSize(rc, 1<<20))
+	// Reuse the []string slice between rows; fields still share one row string.
+	r.ReuseRecord = true
+	// Tolerate trailing / missing columns; parsers read through field().
+	r.FieldsPerRecord = -1
+	r.LazyQuotes = true
+	return r, rc, nil
 }
 
 // ---------------------------------------------------------------------------
@@ -203,7 +213,14 @@ type parentPending struct {
 
 // parseStops reads stops.txt into the stop columns and Index.Stops.
 // Required: stop_id. Optional: stop_name, stop_lat, stop_lon, location_type, parent_station.
-func parseStops(r *csv.Reader, feed *models.Feed, size uint64) error {
+func parseStops(f *zip.File, feed *models.Feed) error {
+	r, c, err := openCSV(f)
+	if err != nil {
+		return err
+	}
+	defer c.Close()
+	size := f.UncompressedSize64
+
 	header, err := r.Read()
 	if err != nil {
 		return fmt.Errorf("gtfs: stops.txt: read header: %w", err)
@@ -322,7 +339,13 @@ func parseStops(r *csv.Reader, feed *models.Feed, size uint64) error {
 
 // parseRoutes reads routes.txt into the route columns and Index.Routes.
 // Required: route_id, route_type. Optional: route_short_name.
-func parseRoutes(r *csv.Reader, feed *models.Feed) error {
+func parseRoutes(f *zip.File, feed *models.Feed) error {
+	r, c, err := openCSV(f)
+	if err != nil {
+		return err
+	}
+	defer c.Close()
+
 	header, err := r.Read()
 	if err != nil {
 		return fmt.Errorf("gtfs: routes.txt: read header: %w", err)
@@ -379,7 +402,13 @@ func parseRoutes(r *csv.Reader, feed *models.Feed) error {
 }
 
 // parseCalendar reads calendar.txt into Calendars and interns service IDs.
-func parseCalendar(r *csv.Reader, feed *models.Feed) error {
+func parseCalendar(f *zip.File, feed *models.Feed) error {
+	r, c, err := openCSV(f)
+	if err != nil {
+		return err
+	}
+	defer c.Close()
+
 	header, err := r.Read()
 	if err != nil {
 		return fmt.Errorf("gtfs: calendar.txt: read header: %w", err)
@@ -458,7 +487,13 @@ func parseCalendar(r *csv.Reader, feed *models.Feed) error {
 
 // parseCalendarDates reads calendar_dates.txt into CalendarDates.
 // Unknown services are interned here (exception-only services).
-func parseCalendarDates(r *csv.Reader, feed *models.Feed) error {
+func parseCalendarDates(f *zip.File, feed *models.Feed) error {
+	r, c, err := openCSV(f)
+	if err != nil {
+		return err
+	}
+	defer c.Close()
+
 	header, err := r.Read()
 	if err != nil {
 		return fmt.Errorf("gtfs: calendar_dates.txt: read header: %w", err)
@@ -509,7 +544,14 @@ func parseCalendarDates(r *csv.Reader, feed *models.Feed) error {
 
 // parseTrips reads trips.txt into trip columns. Needs route and service maps.
 // Required: trip_id, route_id, service_id.
-func parseTrips(r *csv.Reader, feed *models.Feed, size uint64) error {
+func parseTrips(f *zip.File, feed *models.Feed) error {
+	r, c, err := openCSV(f)
+	if err != nil {
+		return err
+	}
+	defer c.Close()
+	size := f.UncompressedSize64
+
 	header, err := r.Read()
 	if err != nil {
 		return fmt.Errorf("gtfs: trips.txt: read header: %w", err)
@@ -587,7 +629,14 @@ func parseTrips(r *csv.Reader, feed *models.Feed, size uint64) error {
 //
 // Hot path: no fmt/strconv/closures on success. Last-trip cache avoids a map
 // lookup on consecutive rows of the same trip (common in TfNSW ordering).
-func parseStopTimes(r *csv.Reader, feed *models.Feed, size uint64) error {
+func parseStopTimes(f *zip.File, feed *models.Feed) error {
+	r, c, err := openCSV(f)
+	if err != nil {
+		return err
+	}
+	defer c.Close()
+	size := f.UncompressedSize64
+
 	header, err := r.Read()
 	if err != nil {
 		return fmt.Errorf("gtfs: stop_times.txt: read header: %w", err)
